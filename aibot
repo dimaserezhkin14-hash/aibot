@@ -1,0 +1,613 @@
+import asyncio
+import base64
+import importlib
+import io
+import json
+import logging
+import re
+import subprocess
+import sys
+import time
+
+
+def ensure_packages():
+    """Сам ставит нужные библиотеки, если их нет."""
+    needed = [
+        ("telegram", "python-telegram-bot"),
+        ("requests", "requests"),
+        ("PIL", "pillow"),
+    ]
+    missing = []
+    for module, pip_name in needed:
+        try:
+            importlib.import_module(module)
+        except ImportError:
+            missing.append(pip_name)
+    if not missing:
+        return
+    print("Устанавливаю библиотеки:", ", ".join(missing), flush=True)
+    cmd = [sys.executable, "-m", "pip", "install", *missing]
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError:
+        subprocess.check_call(cmd + ["--break-system-packages"])
+    importlib.invalidate_caches()
+
+
+ensure_packages()
+
+import requests
+from PIL import Image
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# ====== НАСТРОЙКИ ======
+BOT_TOKEN = "9213052107:AAGj9_Vqz_Z0TjGLq2AqUeemiuHHbowiYL"
+API_KEY = "sk-dc9d4b7df36ba555-nrgaci-fb410a8"
+BASE_URL = "https://anymodel.org/v1"
+
+# Модель по умолчанию (если поставить сюда ag/gemini-2.5-flash-lite, то у всех будет летать)
+FREE_MODEL = "am/nemotron-3-nano-omni-30b-a3b-reasoning"
+
+# Модели в каталоге: (id модели, название)
+CATALOG = [
+    ("ag/gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite ⚡ (мгновенная)"),
+    ("ds/deepseek-v4-flash-vision", "DeepSeek V4 Flash Vision ⚡"),
+    ("glm/glm-5.3-flash", "GLM 5.3 Flash ⚡"),
+    ("glm/glm-4.6v", "GLM 4.6V"),
+    ("cx/gpt-6-astra", "GPT-6 Astra"),
+    ("am/nemotron-3-nano-omni-30b-a3b-reasoning", "Nemotron 3 Nano (бесплатная, медленная)"),
+]
+
+PRICES = {
+    "am/nemotron-3-nano-omni-30b-a3b-reasoning": "бесплатно",
+}
+
+# 800px и качество 68 — текст читается отлично, а вес картинки всего ~40-60 КБ (улетает моментально)
+MAX_SIDE = 800
+JPEG_Q = 68
+MAX_TOKENS = 1500
+DATA_FILE = "bot_users.json"
+PAGE = 8
+
+SYSTEM_PROMPT = (
+    "Ты быстрый и умный ИИ-ассистент с техническим уклоном. Отвечай на русском языке сразу по делу, "
+    "без вступлений и без долгих рассуждений.\n\n"
+    "1. ОБЫЧНЫЕ ВОПРОСЫ И ОБЩЕНИЕ:\n"
+    "На общие вопросы, просьбы написать код или объяснить тему отвечай кратко, понятно и естественно.\n\n"
+    "2. РЕШЕНИЕ ЗАДАЧ (ФИЗИКА, ХИМИЯ, МАТЕМАТИКА, ГЕОМЕТРИЯ):\n"
+    "Оформляй строго как в школьной тетради:\n"
+    "Дано:\n"
+    "(величины и СИ)\n\n"
+    "Найти:\n"
+    "(что найти)\n\n"
+    "Решение:\n"
+    "(формулы и подстановка чисел по шагам)\n\n"
+    "Ответ: (число и ед. изм.).\n"
+    "Для примеров/уравнений без текстового условия сразу пиши 'Решение:' и 'Ответ:'.\n\n"
+    "3. БЕЗ LATEX И MARKDOWN:\n"
+    "Запрещены знаки $, $$, \\frac, \\mu, \\text и разметка ** или ##. "
+    "Пиши обычным текстом: дроби через / (μ = Fтр / N = 2 / 4 = 0.5), умножение через ·, греческие буквы символами (μ, ρ, Δ, π)."
+)
+# =======================
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("ai-bot")
+
+http_session = requests.Session()
+http_session.headers.update({"Authorization": "Bearer " + API_KEY})
+
+users = {}
+
+
+# ---------- лечение кодировки и очистка от LaTeX ----------
+def fix_mojibake(s: str) -> str:
+    """Если строка случайно декодировалась как latin1 вместо utf-8 (ÐÑÐ¸Ð²ÐµÑ), чинит её."""
+    if "Ð" in s or "Ñ" in s:
+        try:
+            return s.encode("latin1").decode("utf-8")
+        except Exception:
+            pass
+    return s
+
+
+def clean_response(text: str) -> str:
+    """Чинит кодировку и убирает LaTeX ($...$, \\frac, \\text) и разметку (**)."""
+    text = fix_mojibake(text)
+
+    # Вырезаем блоки размышлений <think>
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    if "<think>" in text:
+        text = text.split("<think>")[0]
+
+    for _ in range(3):
+        text = re.sub(r"\\(?:text|mathrm|textbf|mathbf|mathit)\{([^{}]*)\}", r"\1", text)
+
+    def repl_frac(m):
+        a, b = m.group(1).strip(), m.group(2).strip()
+        a_str = f"({a})" if any(c in a for c in "+- ") else a
+        b_str = f"({b})" if any(c in b for c in "+- ") else b
+        return f"{a_str} / {b_str}"
+
+    for _ in range(4):
+        text = re.sub(r"\\(?:d|t)?frac\{([^{}]*)\}\{([^{}]*)\}", repl_frac, text)
+
+    text = re.sub(r"\\sqrt\{([^{}]*)\}", r"√(\1)", text)
+    text = text.replace(r"\left", "").replace(r"\right", "")
+
+    replacements = {
+        r"\mu": "μ",
+        r"\alpha": "α",
+        r"\beta": "β",
+        r"\gamma": "γ",
+        r"\Delta": "Δ",
+        r"\delta": "δ",
+        r"\pi": "π",
+        r"\omega": "ω",
+        r"\Omega": "Ом",
+        r"\rho": "ρ",
+        r"\lambda": "λ",
+        r"\eta": "η",
+        r"\varphi": "φ",
+        r"\phi": "φ",
+        r"\cdot": "·",
+        r"\times": "×",
+        r"\div": ":",
+        r"\approx": "≈",
+        r"\neq": "≠",
+        r"\leq": "≤",
+        r"\geq": "≥",
+        r"\le": "≤",
+        r"\ge": "≥",
+        r"\pm": "±",
+        r"\rightarrow": "→",
+        r"\to": "→",
+        r"\Rightarrow": "⇒",
+        r"\infty": "∞",
+        r"\circ": "°",
+        r"\parallel": "||",
+        r"\perp": "⊥",
+        r"\angle": "∠",
+        r"\triangle": "△",
+    }
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+
+    text = re.sub(r"_\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"_([a-zA-Zа-яА-Я0-9]+)", r"\1", text)
+    text = re.sub(r"\^\{([^{}]*)\}", r"^\1", text)
+
+    text = text.replace("$$", "").replace("$", "")
+    text = text.replace(r"\[", "").replace(r"\]", "").replace(r"\(", "").replace(r"\)", "")
+    text = text.replace("{", "").replace("}", "")
+    text = re.sub(r"\\([a-zA-Z]+)", r"\1", text)
+
+    text = text.replace("**", "").replace("__", "")
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+
+    lines = [re.sub(r"[ \t]{2,}", " ", line).strip() for line in text.splitlines()]
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+# ---------- хранилище пользователей ----------
+def load_users():
+    global users
+    try:
+        with open(DATA_FILE, encoding="utf-8") as f:
+            users = json.load(f)
+    except (FileNotFoundError, ValueError):
+        users = {}
+
+
+def save_users():
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False, indent=1)
+
+
+def touch_user(u):
+    uid = str(u.id)
+    uname = u.username or ""
+    name = u.full_name or ""
+    rec = users.get(uid)
+    if rec is None:
+        users[uid] = {"username": uname, "name": name, "model": None, "seen": int(time.time())}
+        save_users()
+        return
+    rec["seen"] = int(time.time())
+    if rec.get("username") != uname or rec.get("name") != name:
+        rec["username"] = uname
+        rec["name"] = name
+        save_users()
+
+
+def get_model(uid) -> str:
+    rec = users.get(str(uid))
+    return (rec.get("model") if rec else None) or FREE_MODEL
+
+
+def model_name(mid: str) -> str:
+    for m, name in CATALOG:
+        if m == mid:
+            return name
+    return mid
+
+
+def model_label(idx: int) -> str:
+    mid, name = CATALOG[idx]
+    price = PRICES.get(mid)
+    return f"{name} · {price}" if price else name
+
+
+# ---------- быстрая обработка фото и стриминг ответа ----------
+def prepare_image(raw: bytes) -> str:
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    img.thumbnail((MAX_SIDE, MAX_SIDE), Image.Resampling.BILINEAR)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=JPEG_Q, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _stream_chunks(model: str, content):
+    """Читает поток байтов строго в UTF-8, чтобы не было кракозябр."""
+    payload = {
+        "model": model,
+        "max_tokens": MAX_TOKENS,
+        "temperature": 0.2,
+        "stream": True,
+        " messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ],
+    }
+    # Поправляем ключ messages и добавляем отключение долгих размышлений, если модель поддерживает
+    payload.pop(" messages", None)
+    payload["messages"] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": content},
+    ]
+
+    with http_session.post(
+        BASE_URL + "/chat/completions",
+        json=payload,
+        stream=True,
+        timeout=(10, 90),
+    ) as r:
+        r.encoding = "utf-8"  # Принудительно ставим UTF-8!
+        if r.status_code != 200:
+            err_text = r.content.decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"HTTP {r.status_code}: {err_text}")
+
+        # Читаем сырые байты и декодируем явно в utf-8
+        for raw_bytes in r.iter_lines(decode_unicode=False):
+            if not raw_bytes:
+                continue
+            line = raw_bytes.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+                delta = chunk["choices"][0].get("delta") or {}
+                piece = delta.get("content") or ""
+                if piece:
+                    yield fix_mojibake(piece)
+            except Exception:
+                continue
+
+
+async def stream_answer(model: str, text: str, image_url, wait_msg) -> str:
+    if image_url:
+        prompt = (
+            text
+            or "Реши задания на фото по школьному формату (Дано, Найти, Решение, Ответ) кратко и сразу к делу."
+        )
+        content = [
+            {"type": "image_url", "image_url": {"url": image_url}},
+            {"type": "text", "text": prompt},
+        ]
+    else:
+        content = text
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def producer():
+        try:
+            for piece in _stream_chunks(model, content):
+                loop.call_soon_threadsafe(queue.put_nowait, ("data", piece))
+            loop.call_soon_threadsafe(queue.put_nowait, ("done", ""))
+        except Exception as e:
+            loop.call_soon_threadsafe(queue.put_nowait, ("err", e))
+
+    fut = loop.run_in_executor(None, producer)
+
+    raw_buf = ""
+    last_edit = 0.0
+    last_shown = ""
+
+    while True:
+        kind, val = await queue.get()
+        if kind == "err":
+            await fut
+            raise val
+        if kind == "done":
+            break
+        raw_buf += val
+        now = time.monotonic()
+        if now - last_edit >= 0.7:
+            cleaned = clean_response(raw_buf)
+            if cleaned and cleaned != last_shown:
+                preview = cleaned[:3900] + " ✍️"
+                try:
+                    await wait_msg.edit_text(preview)
+                    last_shown = cleaned
+                    last_edit = now
+                except Exception:
+                    pass
+
+    await fut
+    return clean_response(raw_buf)
+
+
+async def solve_stream(model: str, text: str, image_url, wait_msg) -> str:
+    order = [model] if model == FREE_MODEL else [model, FREE_MODEL]
+    last_err = None
+    for m in order:
+        try:
+            ans = await stream_answer(m, text, image_url, wait_msg)
+            if ans:
+                return ans
+        except Exception as e:
+            log.warning("Модель %s: %s", m, e)
+            last_err = e
+    raise RuntimeError(str(last_err) if last_err else "модель вернула пустой ответ")
+
+
+def split_text(s: str, n: int = 4000):
+    return [s[i : i + n] for i in range(0, len(s), n)] or [""]
+
+
+# ---------- команды пользователя ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user(update.effective_user)
+    await update.message.reply_text(
+        "Привет! Я быстрый ИИ-помощник.\n"
+        "• Отвечаю на любые вопросы, помогаю с кодом и объясняю темы.\n"
+        "• Решаю задачи по физике, математике, химии как в школе (Дано — Найти — Решение — Ответ).\n"
+        "• Понимаю фото: просто скинь картинку или добавь подпись.\n\n"
+        "Команды: /model — текущая модель, /adminf — управление моделями."
+    )
+
+
+async def my_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user(update.effective_user)
+    mid = get_model(update.effective_user.id)
+    await update.message.reply_text(f"Твоя модель сейчас: {model_name(mid)}")
+
+
+# ---------- админ-панель ----------
+def main_menu(uid: str):
+    cur = get_model(uid)
+    return (
+        f"Админ-панель\nТвоя модель сейчас: {model_name(cur)}\n\n"
+        "⚡ Чтобы ответы прилетали за 1–2 секунды, выбери себе Gemini 2.5 Flash Lite.",
+        InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("⚡ Сменить модель СЕБЕ", callback_data=f"usr:{uid}")],
+                [InlineKeyboardButton("👥 Все пользователи", callback_data="pg:0")],
+                [InlineKeyboardButton("🔎 Найти по ID / @username", callback_data="find")],
+                [InlineKeyboardButton("📋 Список моделей", callback_data="models")],
+                [InlineKeyboardButton("✖ Закрыть", callback_data="close")],
+            ]
+        ),
+    )
+
+
+def users_page(page: int):
+    ids = sorted(users, key=lambda k: users[k].get("seen", 0), reverse=True)
+    pages = max(1, (len(ids) + PAGE - 1) // PAGE)
+    page = max(0, min(page, pages - 1))
+    rows = []
+    for uid in ids[page * PAGE : (page + 1) * PAGE]:
+        rec = users[uid]
+        who = rec.get("name") or uid
+        if rec.get("username"):
+            who += " @" + rec["username"]
+        mark = "🆓" if not rec.get("model") else "⭐"
+        rows.append([InlineKeyboardButton(f"{mark} {who}"[:60], callback_data="usr:" + uid)])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅", callback_data=f"pg:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡", callback_data=f"pg:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("↩ Меню", callback_data="adm")])
+    if ids:
+        text = f"Пользователи: {len(ids)} (стр. {page + 1}/{pages})\n🆓 стандартная модель, ⭐ выдана другая"
+    else:
+        text = "Пока никто не писал боту."
+    return text, InlineKeyboardMarkup(rows)
+
+
+def user_card(uid: str):
+    rec = users.get(uid, {})
+    name = rec.get("name") or "без имени"
+    uname = ("@" + rec["username"]) if rec.get("username") else "нет username"
+    cur = rec.get("model")
+    cur_text = model_name(cur) if cur else f"{model_name(FREE_MODEL)} (по умолчанию)"
+    text = f"Пользователь: {name}\n{uname}\nID: {uid}\nСейчас: {cur_text}\n\nВыбери модель:"
+    rows = []
+    for i, (mid, _) in enumerate(CATALOG):
+        is_cur = (cur or FREE_MODEL) == mid
+        rows.append(
+            [InlineKeyboardButton(("✅ " if is_cur else "") + model_label(i), callback_data=f"gm:{uid}:{i}")]
+        )
+    rows.append([InlineKeyboardButton("🆓 Сбросить по умолчанию", callback_data="rs:" + uid)])
+    rows.append([InlineKeyboardButton("↩ Меню", callback_data="adm")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def models_text():
+    lines = ["Доступные модели:\n"]
+    for i in range(len(CATALOG)):
+        lines.append("• " + model_label(i))
+    return "\n".join(lines)
+
+
+async def adminf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    touch_user(u)
+    context.user_data.pop("await_lookup", None)
+    text, markup = main_menu(str(u.id))
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def show(q, text, markup=None):
+    try:
+        await q.edit_message_text(text, reply_markup=markup)
+    except Exception as e:
+        log.info("edit skipped: %s", e)
+
+
+async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    caller_id = str(q.from_user.id)
+
+    if data == "adm":
+        context.user_data.pop("await_lookup", None)
+        text, markup = main_menu(caller_id)
+        await show(q, text, markup)
+    elif data.startswith("pg:"):
+        text, markup = users_page(int(data[3:]))
+        await show(q, text, markup)
+    elif data.startswith("usr:"):
+        text, markup = user_card(data[4:])
+        await show(q, text, markup)
+    elif data.startswith("gm:"):
+        _, uid, idx = data.split(":")
+        mid, name = CATALOG[int(idx)]
+        rec = users.setdefault(uid, {"username": "", "name": "", "model": None, "seen": 0})
+        rec["model"] = None if mid == FREE_MODEL else mid
+        save_users()
+        if uid != caller_id:
+            try:
+                await context.bot.send_message(int(uid), f"Тебе включили модель: {name}")
+            except Exception:
+                pass
+        text, markup = user_card(uid)
+        await show(q, text, markup)
+    elif data.startswith("rs:"):
+        uid = data[3:]
+        if uid in users:
+            users[uid]["model"] = None
+            save_users()
+        text, markup = user_card(uid)
+        await show(q, text, markup)
+    elif data == "find":
+        context.user_data["await_lookup"] = True
+        await show(
+            q,
+            "Пришли числовой ID или @username одним сообщением.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("↩ Отмена", callback_data="adm")]]),
+        )
+    elif data == "models":
+        await show(q, models_text(), InlineKeyboardMarkup([[InlineKeyboardButton("↩ Меню", callback_data="adm")]]))
+    elif data == "close":
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+
+
+async def lookup_user(msg, t: str):
+    t = t.strip()
+    uid = None
+    if t.lstrip("-").isdigit():
+        uid = t
+    else:
+        uname = t.lstrip("@").lower()
+        for k, rec in users.items():
+            if (rec.get("username") or "").lower() == uname:
+                uid = k
+                break
+    if not uid:
+        await msg.reply_text("Не нашёл. Пришли числовой ID или попроси человека сначала нажать /start.")
+        return
+    if uid not in users:
+        users[uid] = {"username": "", "name": "", "model": None, "seen": 0}
+        save_users()
+    text, markup = user_card(uid)
+    await msg.reply_text(text, reply_markup=markup)
+
+
+# ---------- основной обработчик ----------
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+    user = msg.from_user
+    touch_user(user)
+
+    if msg.text and context.user_data.pop("await_lookup", False):
+        await lookup_user(msg, msg.text)
+        return
+
+    text = (msg.caption or msg.text or "").strip()
+    if not msg.photo and not text:
+        return
+
+    wait = await msg.reply_text("⚡ Думаю...")
+
+    image_url = None
+    if msg.photo:
+        # Берём средний размер фото (~800px), чтобы скачать из ТГ мгновенно
+        photo_obj = msg.photo[-2] if len(msg.photo) > 1 else msg.photo[-1]
+        file = await photo_obj.get_file()
+        raw = bytes(await file.download_as_bytearray())
+        image_url = await asyncio.to_thread(prepare_image, raw)
+
+    try:
+        answer = await solve_stream(get_model(user.id), text, image_url, wait)
+    except Exception as e:
+        log.exception("Ошибка запроса")
+        await wait.edit_text(f"Не получилось: {str(e)[:200]}\nПопробуй ещё раз или смени модель в /adminf.")
+        return
+
+    parts = split_text(answer)
+    try:
+        await wait.edit_text(parts[0])
+    except Exception:
+        pass
+    for part in parts[1:]:
+        await msg.reply_text(part)
+
+
+def main():
+    load_users()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("model", my_model))
+    app.add_handler(CommandHandler("adminf", adminf))
+    app.add_handler(CallbackQueryHandler(admin_cb))
+    app.add_handler(MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), handle))
+    log.info("Бот запущен")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    main()
